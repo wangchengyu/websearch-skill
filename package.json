@@ -1,0 +1,29 @@
+{
+  "name": "skill-websearch",
+  "version": "0.1.0",
+  "description": "Web search skill for pi coding agent: HTTP fast-path + Playwright fallback engines, LLM-friendly output",
+  "type": "commonjs",
+  "bin": {
+    "websearch": "./scripts/search.js",
+    "fetch-page": "./scripts/fetch-page.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "test:live": "RUN_LIVE=1 node --test tests/live.test.js"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-skill",
+    "search"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "playwright": "^1.62.1"
+  },
+  "pi": {
+    "skills": [
+      "./"
+    ]
+  }
+}
