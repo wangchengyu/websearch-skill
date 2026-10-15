@@ -4,7 +4,12 @@
  *
  * 用法:
  *   node fetch-page.js <url> [--format text|md|html] [--wait css] [--fullpage]
- *                       [--timeout ms]
+ *                       [--timeout ms] [--run module.js]
+ *
+ * --run 调用方注入: 加载 module.js 并在导航后以 ({page, browser, ctx, url,
+ * attached}) 调用其导出的 async 函数; 模块接管页面后的全部行为 (默认抽取/
+ * 验证页等待/延时关 tab 全部跳过)。返回 number=退出码; string/object=打印
+ * (object 转 JSON), 退出码默认 0, 可用 {exit, out} 覆盖; 抛错退出 2。
  *
  * 退出码: 0 成功 | 2 失败 | 4 参数错误
  */
@@ -12,13 +17,14 @@ const os = require('os');
 const path = require('path');
 
 function parseArgs(argv) {
-  const o = { format: 'text', fullpage: false, timeoutMs: 30000, url: '', wait: '', help: false };
+  const o = { format: 'text', fullpage: false, timeoutMs: 30000, url: '', wait: '', runModule: '', help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--format') o.format = argv[++i];
     else if (a === '--wait') o.wait = argv[++i];
     else if (a === '--fullpage') o.fullpage = true;
     else if (a === '--timeout') o.timeoutMs = parseInt(argv[++i], 10);
+    else if (a === '--run') o.runModule = argv[++i];
     else if (a === '-h' || a === '--help') o.help = true;
     else if (!a.startsWith('--')) o.url = a;
     else return { error: `未知参数: ${a}` };
@@ -142,7 +148,27 @@ async function run() {
 
     await page.goto(o.url, { waitUntil: 'domcontentloaded', timeout: o.timeoutMs });
     if (o.wait) await page.waitForSelector(o.wait, { timeout: 10000 }).catch(() => {});
-    else await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    else if (!o.runModule) await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+
+    // --run: hand the page to a caller-supplied module (injection hook for
+    // page automation beyond fetching). The module owns everything after the
+    // navigation -- default extraction, interstitial waiting and tab-close
+    // scheduling are all skipped. Contract:
+    //   module.exports = async ({ page, browser, ctx, url, attached }) =>
+    //     number | string | { exit?: number, out?: string|object };
+    // A number is the exit code; a string/object is printed (object as JSON)
+    // with exit 0 unless `exit` overrides; thrown errors exit 2.
+    if (o.runModule) {
+      const mod = require(path.resolve(o.runModule));
+      const r = await mod({ page, browser, ctx, url: o.url, attached });
+      if (typeof r === 'number') return r;
+      const exit = (r && typeof r === 'object' && Number.isInteger(r.exit)) ? r.exit : 0;
+      const out = (r && typeof r === 'object') ? r.out : r;
+      if (out !== undefined && out !== null) {
+        console.log(typeof out === 'string' ? out : JSON.stringify(out, null, 1));
+      }
+      return exit;
+    }
 
     // Verification/login interstitial detection (Atlassian step-up, MFA, SSO, captcha):
     // keep the tab OPEN and poll long enough for the user to complete it manually,
@@ -206,6 +232,7 @@ options:
   --wait css              显式等待选择器 (SPA 页面)
   --fullpage              全页文本而非正文区块
   --timeout ms            页面加载超时 (默认 30000)
+  --run module.js         调用方注入: 导航后将 page 交给模块接管 (见脚本头注释)
 
 退出码: 0 成功 | 2 失败 | 4 参数错误`);
 }
