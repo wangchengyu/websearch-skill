@@ -92,6 +92,7 @@ node scripts/fetch-page.js https://zhuanlan.zhihu.com/p/xxxxx
 - Never overwrite UA/locale/fingerprint and skip stealth injection — attaching is only useful because the profile looks human.
 - In attach mode new pages are created via `browser.contexts()[0].newPage()`.
 - `shutdown()` must only disconnect (`browser.close()` on a CDP connection), never kill the browser process.
+- A fetched tab is NOT closed immediately: fetch-page.js schedules its close 5 minutes later (grace period so the user can review the page; `WS_TAB_CLOSE_DELAY_MS` overrides). The delayed close runs in a detached background process — the caller returns immediately, and a tab closed manually during the window is tolerated silently.
 - If a site needs login/验证码: open that site in a new tab, tell the user, wait for them to finish, then proceed.
 - Unset `WS_CDP_URL` env var after finishing if other work should return to default launch mode.
 

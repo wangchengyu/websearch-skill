@@ -30,18 +30,22 @@ function parseArgs(argv) {
 function extractMain(page, opts) {
   return page.evaluate(({ fullpage }) => {
     const noise =
-      'script,style,noscript,iframe,svg,header,footer,nav,aside,form,' +
+      'script,style,noscript,iframe,svg,header,footer,nav,aside,' +
+      'form[role="search"],form[class*="search" i],' +
       '[role=navigation],[role=banner],[role=complementary],' +
       '.nav,.menu,.sidebar,.footer,.header,.comment,.ad,.ads,.advert,' +
       '#comment,#comments,#sidebar,#nav,.related,.recommend';
 
-    const clone = document.cloneNode(true);
-    clone.querySelectorAll(noise).forEach((n) => n.remove());
-
     if (fullpage) {
-      const text = (clone.body?.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+      // 真实 DOM: cloneNode 脱离渲染树, innerText 恒为空(SPA 如 Jira 拿不到内容)
+      // 本 tab 由脚本自建并在取数后延时关闭, 直接移除噪声再取 innerText
+      document.querySelectorAll(noise).forEach((n) => n.remove());
+      const text = (document.body?.innerText || document.body?.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
       return text;
     }
+
+    const clone = document.cloneNode(true);
+    clone.querySelectorAll(noise).forEach((n) => n.remove());
 
     // 正文候选打分: 文本长度 / 层级深度
     const candidates = Array.from(clone.querySelectorAll('article,main,[role=main],.content,#content,.post,.article,.entry'));
@@ -60,6 +64,49 @@ function extractMain(page, opts) {
     }
     return text;
   }, { fullpage: opts.fullpage });
+}
+
+/**
+ * Detached helper source: sleep, then close the tab via raw CDP.
+ * Runs as a background node process (parent exits right after the fetch), so
+ * the caller is never blocked by the delay. Tolerates the tab having been
+ * closed manually in the meantime (or the browser being gone): any failure
+ * is swallowed -- a missing target just means there is nothing to close.
+ */
+const TAB_CLOSER_SRC = `
+// node -e CODE A B C -> argv = [execPath, A, B, C] (no script-name placeholder)
+const [cdpBase, targetId, delayMs] = process.argv.slice(1);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+(async () => {
+  await sleep(Number(delayMs) || 300000);
+  try {
+    const ver = await (await fetch(cdpBase + '/json/version')).json();
+    const ws = new WebSocket(ver.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+    ws.send(JSON.stringify({ id: 1, method: 'Target.closeTarget', params: { targetId } }));
+    await sleep(500);
+    ws.close();
+  } catch (e) { /* tab already closed manually, or browser gone */ }
+  process.exit(0);
+})();
+`;
+
+/** Schedule the tab to be closed after a grace period (default 5 min) instead
+ * of immediately, so the user can glance at the page. WS_TAB_CLOSE_DELAY_MS
+ * overrides the delay; falls back to an immediate close on any error. */
+async function scheduleTabClose(cdpUrl, page) {
+  try {
+    const session = await page.context().newCDPSession(page);
+    const { targetInfo } = await session.send('Target.getTargetInfo');
+    const delay = Number(process.env.WS_TAB_CLOSE_DELAY_MS) || 300000;
+    const { spawn } = require('child_process');
+    const child = spawn(process.execPath,
+      ['-e', TAB_CLOSER_SRC, cdpUrl, targetInfo.targetId, String(delay)],
+      { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch (e) {
+    await page.close().catch(() => {});
+  }
 }
 
 async function run() {
@@ -97,14 +144,48 @@ async function run() {
     if (o.wait) await page.waitForSelector(o.wait, { timeout: 10000 }).catch(() => {});
     else await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
 
+    // Verification/login interstitial detection (Atlassian step-up, MFA, SSO, captcha):
+    // keep the tab OPEN and poll long enough for the user to complete it manually,
+    // then re-extract once the page navigates away to real content.
+    const isInterstitial = await page.evaluate(() => {
+      const t = (document.body && document.body.innerText) || '';
+      const u = location.href;
+      return /Verify your identity|emailed you a code|verification code/i.test(t)
+        || /login|signin|verifyidentity|sso|challenge/i.test(u);
+    }).catch(() => false);
+
+    if (isInterstitial) {
+      const deadline = Date.now() + (Number(process.env.WS_VERIFY_WAIT_MS) || 300000); // default 5 min
+      console.error('[fetch-page] verification/login page detected: tab left OPEN; waiting for manual completion (max ' + Math.round((deadline - Date.now()) / 1000) + 's, override with WS_VERIFY_WAIT_MS)...');
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(5000);
+        const still = await page.evaluate(() => {
+          const t = (document.body && document.body.innerText) || '';
+          return /Verify your identity|emailed you a code|verification code/i.test(t);
+        }).catch(() => false);
+        if (!still) break; // user completed verification; page navigated to content
+      }
+      // give the post-verification redirect a moment, then fall through to extraction
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    }
+
     if (o.format === 'html') {
-      console.log(await page.content());
+      const html = await page.content();
+      if (attached) await scheduleTabClose(cdp, page);
+      console.log(html);
       return 0;
     }
 
     const text = await extractMain(page, o);
     if (!text) { console.error('[fetch-page] 未抽取到正文'); return 2; }
     console.log(text.slice(0, 50000));
+    // attach 模式: 自建 tab 延时关闭(默认 5 分钟后,期间用户可回看/手动关闭);
+    // 若正文疑似仍是验证/登录页(用户未在等待窗口内完成),保持 tab 打开以便人工继续
+    if (attached) {
+      const looksInterstitial = /Verify your identity|emailed you a code/i.test(text);
+      if (!looksInterstitial) await scheduleTabClose(cdp, page);
+      else console.error('[fetch-page] tab left open: page still on verification/login; complete it in the visible Chrome window and rerun');
+    }
     return 0;
   } catch (e) {
     console.error(`[fetch-page] 失败: ${e.message.split('\n')[0]}`);

@@ -208,23 +208,38 @@ async function resolveGoogleLinks(page, results, max = 10) {
     if (!/^https?:\/\/(www\.)?google\.[a-z.]+\/(goto|url)/i.test(r.url)) continue;
     const idx = hrefs.indexOf(r._href);
     if (idx < 0) continue;
+    // 两个 Promise 都必须被 await/catch, 避免未处理 rejection 崩溃进程
+    const popupPromise = ctx.waitForEvent('page', { timeout: 6000 }).catch(() => null);
+    let clicked = true;
     try {
-      const popupPromise = ctx.waitForEvent('page', { timeout: 6000 });
       await anchors.nth(idx).click({ modifiers: ['Meta'], timeout: 4000 });
-      const popup = await popupPromise;
-      await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
-      await popup.waitForTimeout(400);
-      const finalUrl = popup.url();
-      await popup.close().catch(() => {});
-      if (/^https?:\/\//i.test(finalUrl) && !/google\.[a-z.]+\/(goto|url|search)/i.test(finalUrl)) {
-        r.url = finalUrl.split('#')[0];
-      }
     } catch {
-      // 弹窗被拦截且同页被导航带走时: 回退 SERP 并终止解析
+      clicked = false;
+    }
+    const popup = await popupPromise;
+    if (!clicked && !popup) {
+      // 点击本身失败: SERP 被同页带走则回退并终止, 否则留给 cite 兑底
       if (!page.url().includes('/search')) {
         await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
         return;
       }
+      continue;
+    }
+    if (popup) {
+      try {
+        await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+        await popup.waitForTimeout(400);
+        const finalUrl = popup.url();
+        if (/^https?:\/\//i.test(finalUrl) && !/google\.[a-z.]+\/(goto|url|search)/i.test(finalUrl)) {
+          r.url = finalUrl.split('#')[0];
+        }
+      } finally {
+        await popup.close().catch(() => {});
+      }
+    } else if (!page.url().includes('/search')) {
+      // 点击成功但无弹窗: 可能被同页导航, 回退 SERP 并终止
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
+      return;
     }
   }
 }
